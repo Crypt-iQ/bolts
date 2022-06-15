@@ -612,10 +612,14 @@ the other node then replies similarly, using a fee it thinks is fair.  This
 exchange continues until both agree on the same fee or when one side fails
 the channel.
 
-In the modern method, the funder sends its permissible fee range, and the
-non-funder has to pick a fee in this range. If the non-funder chooses the same
-value, negotiation is complete after two messages, otherwise the funder will
+In the non-musig2 `fee_range` method, the funder sends its permissible fee range,
+and the non-funder has to pick a fee in this range. If the non-funder chooses the
+same value, negotiation is complete after two messages, otherwise the funder will
 reply with the same value (completing after three messages).
+
+In the musig2 `fee_range` method, the flow is identical to the non-musig2
+`fee_range` method except that the fundee may send a `closing_rejected` message to
+communicate their next set of nonces if they disagree on the received range.
 
 1. type: 39 (`closing_signed`)
 2. data:
@@ -630,6 +634,12 @@ reply with the same value (completing after three messages).
     2. data:
         * [`u64`:`min_fee_satoshis`]
         * [`u64`:`max_fee_satoshis`]
+    1. type: 2 (`local_musig2_pubnonce`)
+    2. data:
+        * [`66*byte`:`nonces`]
+    1. type: 4 (`remote_musig2_pubnonce`)
+    2. data:
+        * [`66*byte`:`nonces`]
 
 #### Requirements
 
@@ -640,8 +650,19 @@ The funding node:
 The sending node:
   - SHOULD set the initial `fee_satoshis` according to its estimate of cost of
   inclusion in a block.
-  - SHOULD set `fee_range` according to the minimum and maximum fees it is
-  prepared to pay for a close transaction.
+  - if this is a musig2-taproot channel:
+    - MUST set the `local_musig2_pubnonce` and `remote_musig2_pubnonce`.
+    - MUST set `fee_range` according to the minimum and maximum fees it is prepared
+      to pay for a close transaction.
+    - MUST create `signature` using their previously sent `remote_musig2_pubnonce` and
+      the recipient's `local_musig2_pubnonce`.
+    - if it is the funder:
+      - if a `closing_signed` has already been sent:
+        - MUST wait until receipt of either a corresponding `closing_signed` or
+          corresponding `closing_rejected` before sending this `closing_signed`.
+  - otherwise:
+    - SHOULD set `fee_range` according to the minimum and maximum fees it is
+      prepared to pay for a close transaction.
   - if it doesn't receive a `closing_signed` response after a reasonable amount of time:
     - MUST fail the channel
   - if it is not the funder:
@@ -666,6 +687,8 @@ The receiving node:
     - if there is no overlap between that and its own `fee_range`:
       - SHOULD send a warning
       - MUST fail the channel if it doesn't receive a satisfying `fee_range` after a reasonable amount of time
+      - if it is a musig2-taproot channel:
+        - MUST send a `closing_rejected` with fresh nonces.
     - otherwise:
       - if it is the funder:
         - if `fee_satoshis` is not in the overlap between the sent and received `fee_range`:
@@ -713,6 +736,62 @@ policies (e.g. when using a non-segwit shutdown script for an output below 546
 satoshis, which is possible if `dust_limit_satoshis` is below 546 satoshis).
 No funds are at risk when that happens, but the channel must be force-closed as
 the closing transaction will likely never reach miners.
+
+### Closing Rejected: `closing_rejected`
+
+If the fundee disagrees on the `fee_range` the funder proposes, they may send a
+`closing_rejected` to tell them to try again as well as give them the next set of
+nonces. This can be sent in addition to a `warning` message.
+
+1. type: 40 (`closing_rejected`)
+2. data:
+   * [`channel_id`:`channel_id`]
+   * [`closing_rejected_tlvs`:`tlvs`]
+
+1. `tlv_stream`: `closing_rejected_tlvs`
+2. types:
+    1. type: 0 (`local_musig2_pubnonce`)
+    2. data:
+        * [`66*byte`:`nonces`]
+    1. type: 2 (`remote_musig2_pubnonce`)
+    2. data:
+        * [`66*byte`:`nonces`]
+
+#### Requirements
+
+The sending node (the fundee):
+  - if this is a musig2-taproot channel:
+    - MUST set `local_musig2_pubnonce` and `remote_musig2_pubnonce` to valid nonce
+      values. This means two concatenated 33-byte public keys.
+    - MUST use the `local_musig2_pubnonce` in validating the next received
+      `closing_signed`.
+    - MUST use the `remote_musig2_pubnonce` in signing their next `closing_signed`
+      message UNLESS they have sent a more recent `closing_rejected`.
+    - MUST forget the funder's current `local_musig2_pubnonce` at the time of sending.
+  - otherwise:
+    - MUST NOT send this message.
+
+The receiving node (the funder):
+  - if this is a musig2-taproot channel:
+    - MUST use the `local_musig2_pubnonce` in their next `closing_signed` signature.
+    - MUST use the `remote_musig2_pubnonce` in validating the next received
+      `closing_signed`.
+    - MUST forget about previous `local_musig2_pubnonce` and `remote_musig2_pubnonce`
+      values from the fundee.
+  - otherwise:
+    - MUST fail the channel.
+
+#### Rationale
+
+In order for `fee_range` based closing negotiation to work with musig2-taproot
+channels, it must be a turn-based protocol so valid signatures can be constructed
+at each step. Otherwise, the funder will be unable to construct additional 
+`closing_signed` messages if the fundee disagrees on the sent `fee_range`. This is 
+because the funder has "used up" the fundee's `local_musig2_pubnonce`.
+
+Note that `closing_rejected` consumes the fundee's `remote_musig2_pubnonce` as well
+as the funder's `local_musig2_pubnonce`, just like a regular fundee `closing_signed`
+would.
 
 ## Normal Operation
 
