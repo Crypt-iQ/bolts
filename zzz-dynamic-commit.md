@@ -231,209 +231,45 @@ reestablish message.
 
 This section describes how dynamic commitments can upgrade regular channels to simple
 taproot channels. The regular dynamic proposal phase is executed followed by a signing phase.
-A channel-type will be included in `dyn_propose` and both sides must agree on it. The
-funder of the channel will also propose a fee to use for the kickoff transaction. The fundee
-may reject it in `dyn_propose_reply`. In the regular dynamic proposal phase, the parameters
-that modify the commitment aren't signed for (i.e. `to_self_delay`), however they will be
-when exchanging commitment signatures to upgrade a channel to the simple-taproot-channel type.
-The `dyn_propose_reply` message will contain two nonces for use in signing from the musig2
-output.
+A channel-type will be included in `dyn_propose` and both sides must agree on it. In the
+regular dynamic proposal phase, the parameters that modify the commitment aren't signed for
+(i.e. `to_self_delay`), however they will be when exchanging commitment signatures to upgrade a
+channel to the simple-taproot-channel type.
 
-NOTE: The design of the protocol here does not allow upgrading a channel to taproot and then,
-without having the intermediate transactions confirming on-chain, upgrading to another future
-commitment format.
-
-Extensions to `dyn_propose` and `dyn_propose_reply`:
+Extensions to `dyn_propose`:
 
 1. `tlv_stream`: `dyn_propose_tlvs`
 2. types:
     1. type: 4 (`channel_type`)
     2. data:
         * [`...*byte`:`type`]
-    1. type: 6 (`kickoff_fee`)
-    2. data:
-        * [`u32`:`kickoff_feerate_per_kw`]
 
-1. `tlv_stream`: `dyn_propose_reply_tlvs`
-2. types:
-    1. type: 0 (`local_musig2_pubnonce`)
-    2. data:
-        * [`66*byte`:`nonces`]
-    1. type: 2 (`remote_musig2_pubnonce`)
-    2. data:
-        * [`66*byte`:`nonces`]
-
-The funder MUST only send `kickoff_fee` if they can pay for `kickoff_fee`+660 using their
-own output while adhering to the `channel_reserve` restriction. The fundee MUST reject
-via `dyn_propose_reply` if the funder cannot pay for the kickoff.
-
-In the case that the connection is lost after the proposal phase has completed, but before
-any commitment signatures are sent, the `channel_reestablish` message MUST contain two nonces.
-If a node has sent `dyn_propose_reply` without the `reject` bit, it will persist the
-`channel_type` per the requirements. If a node starts up and sees it has persisted a `channel_type`
-of a simple-taproot-channel from the `dyn_propose_reply` parameters, it MUST send nonces in
-`channel_reestablish`. Otherwise, neither side would be able to send commitment signatures.
+Negotiation should begin on reestablish. Each node will know that they are negotiating a
+simple-taproot-channel if the stored `channel_type` is of the simple-taproot-channel type.
 
 ### Signing Phase
 
-To upgrade a regular channel to a simple-taproot-channel, the original funding output
-must spend to a intermediate, kick-off transaction using a kickoff signature that pays to
-a v1 witness script with a musig2 key as the internal key. Nonces are included in messages
-per the simple-taproot proposal.
+The only change is that the outputs of the commitment transaction spend to v1 witness scripts
+rather than v0 witness scripts. Unlike un-upgraded simple-taproot-channels, dynamically
+upgraded channels do not use musig2 and therefore do not need to exchange nonces.
 
 #### commit_sig
 
-The commit_sig does not change, but adds a nonce in the TLV section per the simple-taproot
-channel proposal. It changes what it signs in the following ways:
+The commit_sig does not change, but will sign for upgraded witness scripts for all outputs.
+The fee may change depending on the type of the original channel. If upgrading from an anchors
+channel, the fee is identical since it is a simple v0->v1 mapping. If upgrading from a pre-
+anchors channel, then anchor outputs will be added and the `to_remote` output will go from a
+p2wpkh->p2tr output which has a slightly higher weight.
 
-- `txin[0]` outpoint is the outpoint of the kickoff transaction's new musig2 funding outpoint.
-- Because the new musig2 funding outpoint has a smaller amount, the funder's `to_local`
-  balance is reduced. The `dyn_propose` stage won't complete if the funder cannot pay for the
-  kickoff transaction's fees on either commitment transaction.
-
-1. `tlv_stream`: `commit_sig_tlvs`
-2. types:
-    1. type: 2 (`remote_musig2_pubnonce`)
-    2. data:
-        * [`66*byte`:`nonces`]
-
-#### kickoff_sig
-
-The kickoff_sig is a signature that is combined with the corresponding one from the remote
-party to spend from the original funding outpoint into the new musig2 output. To keep things
-simple, no additional inputs are added to the intermediate transaction. An anchor output is
-attached for either side. See
-https://github.com/lightning/bolts/pull/863#pullrequestreview-1023605285 for more context.
-An anchor output is required at the kickoff-tx level so that CPFP Carve Out still works. The
-semantics of carve out are such that the "carve-out" transaction must only have one ancestor.
-Therefore, using the commitment transaction's anchor as a carve-out wouldn't work since it
-would have an ancestor of the commitment transaction and of the kickoff transaction. Using
-anchors at the kickoff transaction level makes the commitment transaction anchors redundant
-in adversarial scenarios, but they are still used to keep the commitment transaction format
-consistent. Each side will ALWAYS have an anchor on the kickoff transaction.
-
-1. type: 777 (`kickoff_sig`)
-2. data:
-   * [`32*byte`:`channel_id`]
-   * [`signature`:`signature`]
-
-The `kickoff_sig` message signs the below transaction.
-
-Kickoff transaction format:
-
-* version: 2
-* locktime: 0
-* txin count: 1
-  * `txin[0]` outpoint: `txid` and `output_index` from the `funding_created` message
-  * `txin[0]` sequence: 0
-  * `txin[0]` script bytes: 0
-  * `txin[0]` witness: `0 <signature_for_pubkey1> <signature_for_pubkey2>`
-
-`new_funding_output`:
-  * `txout[0]` amount: `txin[0].amount - 660 - kickoff_feerate_per_kw*kickoff_transaction_weight/1000`
-  
-This is a version 1 witness script:
-  * `OP_1 funding_key`
-  * where:
-    * `funding_key = combined_funding_key + tagged_hash("TapTweak", combined_funding_key)*G`
-    * `combined_funding_key = musig2.KeyAgg(musig2.KeySort(pubkey1, pubkey2))`
-  
-The funding keys are reused here, but this should not be a big deal.
-
-`anchor_output_1`
-  * `txout[1]` amount: 330
-
-This is a version 1 witness script:
-  * `OP_1 anchor_output_key`
-  * where:
-    * `anchor_internal_key = local_funding_pubkey/remote_funding_pubkey`
-    * `anchor_output_key = anchor_internal_key + tagged_hash("TapTweak", anchor_internal_key || anchor_script_root)`
-    * `anchor_script_root = tapscript_root([anchor_script])`
-    * `anchor_script`:
-        ```
-        OP_16 OP_CHECKSEQUENCEVERIFY
-        ```
-
-`anchor_output_2`
-  * Idential to `anchor_output_1` except the key is for the opposite party.
-
-Weight:
-  * p2tr: 34 bytes
-    - OP_1: 1 byte
-    - OP_DATA: 1 byte (witness_script_SHA256 length)
-    - witness_script_SHA256: 32 bytes
-
-  * witness_header: 2 bytes
-    - flag: 1 byte
-    - marker: 1 byte
-
-  * funding_output_script: 71 bytes
-    - OP_2: 1 byte
-    - OP_DATA: 1 byte (pub_key_alice length)
-    - pub_key_alice: 33 bytes
-    - OP_DATA: 1 byte (pub_key_bob length)
-    - pub_key_bob: 33 bytes
-    - OP_2: 1 byte
-    - OP_CHECKMULTISIG: 1 byte
-
-  * funding_input_witness: 222 bytes
-    - number_of_witness_elements: 1 byte
-    - nil_length: 1 byte
-    - sig_alice_length: 1 byte
-    - sig_alice: 73 bytes
-    - sig_bob_length: 1 byte
-    - sig_bob: 73 bytes
-    - witness_script_length: 1 byte
-    - witness_script: 71 bytes (funding_output_script)
-
-  * kickoff_txin_0: 41 bytes (excl. witness)
-    - previous_out_point: 36 bytes
-      - hash: 32 bytes
-      - index: 4 bytes
-    - var_int: 1 byte (script_sig length)
-    - script_sig: 0 bytes
-    - witness: SOLD SEPARATELY
-    - sequence: 4 bytes
-
-  * musig2_funding_output: 43 bytes
-    - value: 8 bytes
-    - var_int: 1 byte (pk_script length)
-    - pk_script (p2tr): 34 bytes
-
-  * anchor_output: 43 bytes
-    - value: 8 bytes
-    - var_int: 1 byte (pk_script length)
-    - pk_script (p2tr): 34 bytes
-
-  * kickoff_transaction: 180 bytes (excl. witness)
-    - version: 4 bytes
-    - witness_header: SOLD SEPARATELY
-    - count_tx_in: 1 byte
-    - tx_in: 41 bytes
-      - kickoff_txin_0: 41 bytes
-    - count_tx_out: 1 byte
-    - txout: 129 bytes
-      - musig2_funding_output: 43 bytes
-      - anchor_output_local: 43 bytes
-      - anchor_output_remote: 43 bytes
-    - lock_time: 4 bytes
-
-  - Multiplying non-witness data by 4 gives a weight of:
-    - kickoff_transaction_weight = kickoff_transaction * 4 = 720WU
-  - Adding the witness data:
-    - kickoff_transaction_weight += (funding_input_witness + witness_header)
-    - kickoff_transaction_weight = 944WU
+The fundee should reject the dynamic commitment proposal if the funder cannot pay for the
+upgrade. The funder should likewise reject a dynamic commitment proposal from the fundee if
+they cannot afford to upgrade to a simple-taproot-channel. This should happen during the
+`dyn_propose/dyn_propose_reply` phase.
 
 #### revoke_and_ack
 
-Per the simple-taproot-channel proposal, the `revoke_and_ack` message contains a single pair
-of nonces used by the recipient to construct a commitment transaction for the sender.
-
-1. `tlv_stream`: `revoke_and_ack_tlvs`
-2. types:
-    1. type: 2 (`local_musig2_pubnonce`)
-    2. data:
-        * [`66*byte`:`nonces`]
+This message is used during the flow to ensure that once negotiation is complete, the channel
+has been irrevocably upgraded to a non-musig2 simple-taproot-channel.
 
 #### The message flow to upgrade a channel to simple-taproot:
 
@@ -441,29 +277,9 @@ of nonces used by the recipient to construct a commitment transaction for the se
         |       |--(1)------ commit_sig ------->|       |
         |       |                               |       |
         |       |<-(2)------ commit_sig --------|       |
-        |   A   |--(3)----- kickoff_sig ------->|   B   |
-        |       |                               |       |
-        |       |<-(4)----- kickoff_sig --------|       |
+        |   A   |                               |   B   |
         |       |<-(5)----- rev_and_ack --------|       |
         |       |--(6)----- rev_and_ack ------->|       |
-        +-------+                               +-------+
-
-The ordering here is important. If the sending of kickoff signatures was first, then one
-side could choose to not send their kickoff signature and wait to receive the counterparty's. Then
-once it's received, broadcast the intermediate kick-off transaction that neither side
-can claim since commitment signatures weren't exchanged first. The kickoff signatures MUST only
-be sent if a `commit_sig` has been sent and received.
-
-The `revoke_and_ack` messages are intentionally last. They must only be sent if an `kickoff_sig`
-has been received. Otherwise the following flow means that A cannot force close its own channel:
-
-        +-------+                               +-------+
-        |       |--(1)------ commit_sig ------->|       |
-        |       |                               |       |
-        |       |<-(2)------ commit_sig --------|       |
-        |   A   |--(3)----- kickoff_sig ------->|   B   |
-        |       |                               |       |
-        |       |--(4)----- rev_and_ack ------->|       |
         +-------+                               +-------+
 
 Including `revoke_and_ack` in the signing phase means that it is possible to determine when the flow
@@ -488,10 +304,8 @@ signature, such as in the below scenario:
 
 Note that on restart B is not able to tell if M received `dyn_propose_reply` and `commit_sig`.
 If a total restart was allowed, then M might be able to propose N different `to_self_delay`
-and receive signatures for N different commitment transactions. Then, M could complete the signing
-phase up until receiving an `kickoff_sig` and broadcast any one of the N commitment transactions.
-To avoid an implementation keeping track of N valid commitments, we disallow restarting
-the flow.
+and receive signatures for N different commitment transactions. To avoid an implementation
+keeping track of N valid commitments, we disallow restarting the flow.
 
 This is avoided by _requiring_ that if one side has sent and received `dyn_propose_reply`,
 the negotiation MUST finish or the channel is force closed. Before this point, neither
@@ -500,15 +314,12 @@ node can determine whether negotiation is done.
 ### Reestablish Taproot
 
 On reestablish things are simple. The signature MUST sign the exact same commitment
-transaction, but will use different nonces. The kickoff signature MUST also sign the same
-transaction each time. Nonces will be sent if the saved, proposed `channel_type` indicates
-that taproot was negotiated in the `dyn_propose` step.
+transaction.
 
 No matter where the nodes were in the signing phase, it starts at the beginning on reconnect.
-This simplifies the flow. If a duplicate `commitment_signed`, `kickoff_sig`, or `revoke_and_ack`
-is received, everything except the nonces can be ignored. This is unlike the regular channel
-update flow, but since each party knows it is performing dynamic commitment negotiation,
-duplicate messages can be tolerated.
+This simplifies the flow. If a duplicate `commitment_signed` or `revoke_and_ack` is received,
+it can be ignored. This is unlike the regular channel update flow, but since each party knows
+it is performing dynamic commitment negotiation, duplicate messages can be tolerated.
 
 The signing phase is complete when a node receives a `channel_reestablish` with a
 `next_revocation_number` that is greater than their local commitment number at the start of
