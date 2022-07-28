@@ -309,7 +309,7 @@ possible to use the commitment transaction's anchor as a carve-out since it has 
 the commit tx and the kickoff tx. Using anchors at the kickoff transaction level allow one
 party to "use up" the CPFP carve-out slot since there are 3 spendable outputs on the kickoff
 transaction and carve-out only works if there are 2. Each side will ALWAYS have an anchor on
-the kickoff transaction.
+the kickoff transaction. See the Pinning section below for more details.
 
 1. type: 777 (`kickoff_sig`)
 2. data:
@@ -515,3 +515,50 @@ the dynamic proposal flow AND when its sent `next_revocation_number` is greater 
 commitment number at the start of the dynamic proposal flow. This requires each side to
 remember the starting commitment heights when acknowleding and persisting received
 `dyn_propose` parameters.
+
+## Pinning
+
+### Commitment Pinning
+
+![Commitment Pinning](./dyncom/commitpin.png)
+
+In this picture, A has a commitment transaction with an HTLC on it. A is able to broadcast
+the kickoff transaction and the commitment transaction and a tree of descendants extending
+from A's commitment anchor output. If the set of transactions is at the mempool limit, then
+B is unable to use their anchor output (anchor2 in the picture) for CPFP carve-out. This is
+because CPFP carve-out requires that the carve-out transaction only have one ancestor in the
+mempool. B's carve-out transaction would have 2 (the kickoff transaction and the commitment
+transaction).
+
+### Kickoff Pinning
+
+![Kickoff Pinning](./dyncom/kickoffpin.png)
+
+In this picture, A performs the same steps as in the commitment pinning picture, except that
+A also spends the kickoff transaction's anchor via CPFP-Carve Out. This prevents B from using
+CPFP Carve-Out via B's anchor output on the kickoff transaction since carve out allows _one_
+extra descendant, not _two_.
+
+The reason this issue exists is because there are three spendable outputs on the kickoff
+transaction - the new funding output and the two anchors. One approach would be to time-lock
+the new funding transaction, but this would change the commitment transaction format (perhaps
+non-trivially) because of nSequence. Another alternative explored was to have asymmetric kickoff
+transactions, but this also doesn't work since only one side is able to fee-bump the kickoff
+transaction which doesn't work well in adversarial scenarios. 
+
+### Solution
+
+One version of dynamic commitments only broadcasted the kickoff transaction at closing time.
+However, since this allowed pinning HTLCs, the kickoff transaction should have similar rules to
+a splice:
+
+- after completing the dynamic commitment flow and both sides have exchanged `revoke_and_ack`,
+  the kickoff transaction is broadcast
+- no channel updates may occur until the kickoff transaction is confirmed on-chain with a sufficient
+  number of blocks
+
+The commitment transaction is vulnerable to pinning while the kickoff transaction is unconfirmed,
+but since there are no HTLCs on it, there is no material gain for the attacker. This has very similar
+requirements to a splice transaction in that the rest of the network MUST NOT see the kickoff transaction
+confirmation as a channel close. It might be possible to combine the kickoff transaction with a splice
+to add funds and change the commitment format at the same time.
